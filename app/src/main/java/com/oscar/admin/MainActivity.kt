@@ -117,16 +117,13 @@ class MainActivity : AppCompatActivity() {
             var action = p.action !== undefined ? p.action : (p.direction !== undefined ? p.direction : p.side);
             var expiry = p.time || p.duration || p.expiry || 60;
 
-            if (!asset || !amount) {
-                log('Missing: ' + Object.keys(p).join(','));
-                return;
-            }
+            if (!asset || !amount) return;
 
             var dir = null;
             if (action === 1 || action === 'call' || action === 'up' || action === true) dir = 'call';
             else if (action === -1 || action === 'put' || action === 'down' || action === false) dir = 'put';
 
-            if (!dir) { log('BadDir: ' + String(action)); return; }
+            if (!dir) return;
 
             var trade = {
                 asset: String(asset),
@@ -207,7 +204,7 @@ class MainActivity : AppCompatActivity() {
                     if (opts && opts.body) {
                         var body = String(opts.body);
                         if (body.indexOf('asset') !== -1 && (body.indexOf('amount') !== -1 || body.indexOf('sum') !== -1)) {
-                            raw('[FETCH] ' + (typeof url === 'string' ? url : (url && url.url) || '') + ' | ' + body.substring(0, 400));
+                            raw('[FETCH] ' + body.substring(0, 400));
                             processText(body);
                         }
                     }
@@ -231,32 +228,6 @@ class MainActivity : AppCompatActivity() {
                 return origXhrSend.apply(this, arguments);
             };
         }
-
-        var demoAttempts = 0;
-        function tryForceDemo() {
-            if (demoAttempts > 15) return;
-            try {
-                var sels = [
-                    '[data-account="demo"]:not(.active):not(.selected)',
-                    '[data-account-type="demo"]:not(.active):not(.selected)',
-                    '[data-testid="demo-account"]:not(.active):not(.selected)'
-                ];
-                for (var i = 0; i < sels.length; i++) {
-                    var el = document.querySelector(sels[i]);
-                    if (el) { el.click(); demoAttempts++; log('ForcedDemo#' + i); return; }
-                }
-                var clickables = document.querySelectorAll('button, [role="button"], [role="tab"]');
-                for (var j = 0; j < clickables.length; j++) {
-                    var t = (clickables[j].textContent || '').trim();
-                    if ((t === 'Demo' || t === 'تجريبي' || t.toLowerCase() === 'demo')
-                        && !clickables[j].classList.contains('active')
-                        && !clickables[j].classList.contains('selected')) {
-                        clickables[j].click(); demoAttempts++; log('ForcedDemoText'); return;
-                    }
-                }
-            } catch(e) {}
-        }
-        setInterval(tryForceDemo, 3000);
 
         log('Hook injected');
     })();
@@ -284,10 +255,8 @@ class MainActivity : AppCompatActivity() {
                 val res = client.newCall(req).execute()
                 val json = JSONObject(res.body?.string() ?: "{}")
                 isMasterLinked = json.optBoolean("linked", false)
-                android.util.Log.d("OscarAdmin", "is_linked check: $isMasterLinked")
             } catch (e: Exception) {
                 isMasterLinked = false
-                android.util.Log.e("OscarAdmin", "is_linked check failed: ${e.message}")
             }
             withContext(Dispatchers.Main) { callback() }
         }
@@ -501,14 +470,70 @@ class MainActivity : AppCompatActivity() {
                 if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
             }
         }
+
+        // ★★★ هذا هو الإصلاح الرئيسي - يدعم confirm() و alert() و prompt() ★★★
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onJsAlert(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: JsResult?
+            ): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("تنبيه")
+                    .setMessage(message)
+                    .setCancelable(false)
+                    .setPositiveButton("حسناً") { _, _ -> result?.confirm() }
+                    .setOnDismissListener { result?.cancel() }
+                    .show()
+                return true
+            }
+
+            override fun onJsConfirm(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: JsResult?
+            ): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("تأكيد")
+                    .setMessage(message)
+                    .setCancelable(false)
+                    .setPositiveButton("نعم") { _, _ -> result?.confirm() }
+                    .setNegativeButton("لا") { _, _ -> result?.cancel() }
+                    .setOnDismissListener { result?.cancel() }
+                    .show()
+                return true
+            }
+
+            override fun onJsPrompt(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                defaultValue: String?,
+                result: JsPromptResult?
+            ): Boolean {
+                val input = EditText(this@MainActivity).apply {
+                    setText(defaultValue ?: "")
+                    setPadding(30, 30, 30, 30)
+                }
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("إدخال")
+                    .setMessage(message)
+                    .setView(input)
+                    .setCancelable(false)
+                    .setPositiveButton("موافق") { _, _ -> result?.confirm(input.text.toString()) }
+                    .setNegativeButton("إلغاء") { _, _ -> result?.cancel() }
+                    .setOnDismissListener { result?.cancel() }
+                    .show()
+                return true
+            }
+        }
     }
 
     private fun sendSsidToServer(ssid: String) {
         if (ssidSentThisSession || ssid.length < 25) return
-        if (isMasterLinked) {
-            android.util.Log.d("OscarAdmin", "Already linked, skipping SSID")
-            return
-        }
+        if (isMasterLinked) return
         ssidSentThisSession = true
         statusBar.text = "🔄 جاري ربط حساب الماستر..."
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
@@ -567,19 +592,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendRawToServer(raw: String) {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val payload = JSONObject().put("raw", raw)
-                val req = Request.Builder()
-                    .url("$BASE_URL/api/admin/realtime_trade")
-                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
-                client.newCall(req).execute()
-            } catch (e: Exception) {}
-        }
-    }
-
     private fun logoutAdmin() {
         prefs.edit().remove("is_admin_logged_in").apply()
         val cm = CookieManager.getInstance()
@@ -610,17 +622,11 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onLog(msg: String) {
             android.util.Log.d("OscarAdminJS", msg)
-            runOnUiThread {
-                if (currentTab == "market" && (msg.startsWith("TRADE:") || msg.startsWith("Missing") || msg.startsWith("BadDir") || msg.startsWith("ParseFail"))) {
-                    statusBar.text = "🔍 $msg"
-                }
-            }
         }
 
         @JavascriptInterface
         fun onRaw(raw: String) {
             android.util.Log.d("OscarAdminRAW", raw)
-            sendRawToServer(raw)
         }
     }
 
