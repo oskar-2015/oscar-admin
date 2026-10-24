@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
-import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -56,36 +55,55 @@ class MainActivity : AppCompatActivity() {
         if (window.__oscarEarlyHook) return;
         window.__oscarEarlyHook = true;
 
-        function extractAndSend(text) {
+        function pushSsid(v) {
+            if (v && typeof v === 'string' && v.length > 25 && v.length < 5000) {
+                if (window.OscarBridge && window.OscarBridge.onSsid) {
+                    window.OscarBridge.onSsid(v);
+                }
+            }
+        }
+
+        function tryExtractTrade(text) {
+            if (typeof text !== 'string' || text.indexOf('["') === -1) return;
+            // Socket.IO format: 42["event",{...}]
+            var m = text.match(/^42\[\s*"([^"]+)"\s*,\s*(\{[\s\S]*\})\s*\]$/);
+            if (!m) return;
+            var eventName = m[1];
+            if (eventName !== 'buy' && eventName !== 'trade' && eventName !== 'order') return;
+            try {
+                var p = JSON.parse(m[2]);
+                var asset = p.asset || p.symbol || p.instrument;
+                var action = p.action || p.direction || p.side;
+                var amount = p.amount || p.sum || p.price;
+                var expiry = p.time || p.duration || p.expiry || 60;
+                if (!asset || !action || !amount) return;
+                var dir = null;
+                if (action === 1 || action === 'call' || action === 'up') dir = 'call';
+                else if (action === -1 || action === 'put' || action === 'down') dir = 'put';
+                if (!dir) return;
+                var trade = {
+                    asset: String(asset),
+                    direction: dir,
+                    amount: parseFloat(amount),
+                    expiry: parseInt(expiry)
+                };
+                if (window.OscarBridge && window.OscarBridge.onTrade) {
+                    window.OscarBridge.onTrade(JSON.stringify(trade));
+                }
+            } catch(e) {}
+        }
+
+        function processText(text) {
             try {
                 if (typeof text !== 'string' || text.length < 5) return;
-                // استخراج SSID
+                // SSID extraction
                 var pats = [ /"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/ ];
                 for (var i = 0; i < pats.length; i++) {
-                    var m = text.match(pats[i]);
-                    if (m && m[1] && m[1].length > 25) {
-                        if (window.OscarBridge && window.OscarBridge.onSsid) {
-                            window.OscarBridge.onSsid(m[1]);
-                        }
-                    }
+                    var mm = text.match(pats[i]);
+                    if (mm && mm[1]) pushSsid(mm[1]);
                 }
-                // اعتراض الصفقات
-                if (text.indexOf('"buy"') !== -1 || text.indexOf('"order"') !== -1) {
-                    try {
-                        var data = JSON.parse(text);
-                        if (data && data.asset && data.direction && data.amount && data.duration) {
-                            var trade = {
-                                asset: data.asset,
-                                direction: data.direction,
-                                amount: data.amount,
-                                expiry: data.duration
-                            };
-                            if (window.OscarBridge && window.OscarBridge.onTrade) {
-                                window.OscarBridge.onTrade(JSON.stringify(trade));
-                            }
-                        }
-                    } catch(e) {}
-                }
+                // Trade extraction
+                tryExtractTrade(text);
             } catch(e) {}
         }
 
@@ -98,7 +116,7 @@ class MainActivity : AppCompatActivity() {
                     ws.addEventListener = function(type, listener, opts) {
                         if (type === 'message') {
                             return origAdd(type, function(ev) {
-                                if (typeof ev.data === 'string') extractAndSend(ev.data);
+                                if (typeof ev.data === 'string') processText(ev.data);
                                 return listener(ev);
                             }, opts);
                         }
@@ -113,10 +131,11 @@ class MainActivity : AppCompatActivity() {
             HookedWS.CLOSING = OWS.CLOSING; HookedWS.CLOSED = OWS.CLOSED;
             window.WebSocket = HookedWS;
         }
+
         if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
             var origSend = window.WebSocket.prototype.send;
             window.WebSocket.prototype.send = function(data) {
-                if (typeof data === 'string') extractAndSend(data);
+                if (typeof data === 'string') processText(data);
                 return origSend.apply(this, arguments);
             };
         }
@@ -152,7 +171,7 @@ class MainActivity : AppCompatActivity() {
 
         AlertDialog.Builder(this)
             .setTitle("🔐 دخول المشرف")
-            .setMessage("يرجى إدخال كلمة المرور للوصول إلى لوحة التحكم")
+            .setMessage("يرجى إدخال كلمة المرور")
             .setView(container)
             .setCancelable(false)
             .setNegativeButton("خروج") { _, _ -> finish() }
@@ -163,10 +182,7 @@ class MainActivity : AppCompatActivity() {
                     val btn = getButton(AlertDialog.BUTTON_POSITIVE)
                     btn.setOnClickListener {
                         val pwd = input.text.toString().trim()
-                        if (pwd.isEmpty()) {
-                            Toast.makeText(this@MainActivity, "الرجاء إدخال كلمة المرور", Toast.LENGTH_SHORT).show()
-                            return@setOnClickListener
-                        }
+                        if (pwd.isEmpty()) return@setOnClickListener
                         btn.isEnabled = false
                         btn.text = "جاري التحقق..."
                         verifyAdminPassword(pwd) { ok, err ->
@@ -267,7 +283,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMarket() {
         currentTab = "market"
-        statusBar.text = "📈 السوق — سجّل دخولك لربط الحساب"
+        statusBar.text = "📈 السوق — قم بأي صفقة وستُنسخ فوراً"
         updateTabButtons()
         if (webView.url == null || !webView.url!!.contains("quotex.com")) {
             webView.loadUrl("$QX_DOMAIN/ar/trade")
@@ -305,10 +321,6 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
-            
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                return false
-            }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
@@ -317,9 +329,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
-                if (url.contains("quotex.com")) {
-                    view.evaluateJavascript(EARLY_HOOK_JS, null)
-                }
+                if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
@@ -328,11 +338,8 @@ class MainActivity : AppCompatActivity() {
                     lastFailedUrl = request?.url.toString()
                     statusBar.text = "⚠️ فشل الاتصال، جاري إعادة المحاولة..."
                     Handler(Looper.getMainLooper()).postDelayed({
-                        val urlToRetry = lastFailedUrl
-                        if (urlToRetry != null) {
-                            view?.loadUrl(urlToRetry)
-                            lastFailedUrl = null
-                        }
+                        val u = lastFailedUrl
+                        if (u != null) { view?.loadUrl(u); lastFailedUrl = null }
                     }, 1500)
                 }
             }
@@ -343,7 +350,6 @@ class MainActivity : AppCompatActivity() {
         if (isProcessingSSID || ssid.length < 25) return
         isProcessingSSID = true
         statusBar.text = "🔄 جاري ربط حساب الماستر..."
-        
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
 
         CoroutineScope(Dispatchers.IO).launch {
@@ -358,27 +364,22 @@ class MainActivity : AppCompatActivity() {
                     .build()
                 val res = client.newCall(req).execute()
                 val json = JSONObject(res.body?.string() ?: "{}")
-
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        statusBar.text = "✅ تم ربط حساب الماستر بنجاح!"
-                        Toast.makeText(this@MainActivity, "تم ربط الحساب", Toast.LENGTH_LONG).show()
+                        statusBar.text = "✅ تم ربط الحساب"
                     } else {
-                        val err = json.optString("error", "خطأ")
-                        statusBar.text = "⚠️ فشل: $err"
+                        statusBar.text = "⚠️ ${json.optString("error")}"
                     }
                     isProcessingSSID = false
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    statusBar.text = "⚠️ خطأ اتصال: ${e.message}"
-                    isProcessingSSID = false
-                }
+                withContext(Dispatchers.Main) { isProcessingSSID = false }
             }
         }
     }
 
     private fun sendTradeToServer(tradeJson: String) {
+        statusBar.text = "📤 جاري إرسال الصفقة للمتابعين..."
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val payload = JSONObject(tradeJson)
@@ -390,15 +391,16 @@ class MainActivity : AppCompatActivity() {
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        Toast.makeText(this@MainActivity, "✅ تم نسخ الصفقة إلى ${json.optInt("copied")} مستخدم", Toast.LENGTH_SHORT).show()
+                        val copied = json.optInt("copied", 0)
+                        val total = json.optInt("total", 0)
+                        statusBar.text = "✅ نُسخت لـ $copied من $total متابع"
+                        Toast.makeText(this@MainActivity, "✅ نُسخت لـ $copied من $total", Toast.LENGTH_SHORT).show()
                     } else {
-                        Toast.makeText(this@MainActivity, "⚠️ فشل نسخ الصفقة: ${json.optString("error")}", Toast.LENGTH_SHORT).show()
+                        statusBar.text = "⚠️ ${json.optString("error")}"
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "خطأ اتصال: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
+                withContext(Dispatchers.Main) { statusBar.text = "⚠️ خطأ: ${e.message}" }
             }
         }
     }
@@ -408,44 +410,22 @@ class MainActivity : AppCompatActivity() {
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
             runOnUiThread {
-                if (currentTab == "market" && !isProcessingSSID) {
-                    sendSsidToServer(ssid)
-                }
+                if (currentTab == "market" && !isProcessingSSID) sendSsidToServer(ssid)
             }
         }
 
         @JavascriptInterface
         fun onTrade(tradeJson: String) {
             runOnUiThread {
-                if (currentTab == "market") {
-                    sendTradeToServer(tradeJson)
-                }
+                if (currentTab == "market") sendTradeToServer(tradeJson)
             }
         }
     }
 
-    private fun logoutAdmin() {
-        prefs.edit().remove("is_admin_logged_in").apply()
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.removeAllCookies(null)
-        cookieManager.flush()
-        webView.clearCache(true)
-        webView.clearHistory()
-        webView.loadUrl("about:blank")
-        isLoggedIn = false
-        val intent = Intent(this, MainActivity::class.java)
-        finish()
-        startActivity(intent)
-    }
-
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (currentTab == "market") {
-            showSettings()
-        } else if (::webView.isInitialized && webView.canGoBack()) {
-            webView.goBack()
-        } else {
-            super.onBackPressed()
-        }
+        if (currentTab == "market") showSettings()
+        else if (::webView.isInitialized && webView.canGoBack()) webView.goBack()
+        else super.onBackPressed()
     }
 }
