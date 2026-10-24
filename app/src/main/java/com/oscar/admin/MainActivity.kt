@@ -14,6 +14,7 @@ import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import kotlinx.coroutines.CoroutineScope
@@ -31,6 +32,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusBar: TextView
     private lateinit var webView: WebView
+    private lateinit var swipeRefresh: SwipeRefreshLayout
     private lateinit var btnSettings: Button
     private lateinit var btnMarket: Button
     private lateinit var prefs: SharedPreferences
@@ -38,7 +40,7 @@ class MainActivity : AppCompatActivity() {
     private var currentTab = "settings"
     private var isLoggedIn = false
     private var isMasterLinked = false
-    private var hasCapturedThisSession = false
+    private var ssidSentThisSession = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -51,14 +53,21 @@ class MainActivity : AppCompatActivity() {
 
     private val EARLY_HOOK_JS = """
     (function() {
-        if (window.__oscarEarlyHook) return;
-        window.__oscarEarlyHook = true;
+        if (window.__oscarAdminHook) return;
+        window.__oscarAdminHook = true;
 
-        // =========== helpers ===========
-        function logToBridge(msg) {
+        function log(msg) {
             try {
                 if (window.OscarBridge && window.OscarBridge.onLog) {
                     window.OscarBridge.onLog(String(msg).substring(0, 300));
+                }
+            } catch(e) {}
+        }
+
+        function raw(msg) {
+            try {
+                if (window.OscarBridge && window.OscarBridge.onRaw) {
+                    window.OscarBridge.onRaw(String(msg).substring(0, 500));
                 }
             } catch(e) {}
         }
@@ -73,65 +82,81 @@ class MainActivity : AppCompatActivity() {
             } catch(e) {}
         }
 
-        // =========== trade extraction ===========
+        function findJsonEnd(text, start) {
+            var depth = 0;
+            var inString = false;
+            var escapeNext = false;
+            for (var i = start; i < text.length; i++) {
+                var c = text[i];
+                if (escapeNext) { escapeNext = false; continue; }
+                if (c === '\\') { escapeNext = true; continue; }
+                if (c === '"' && !inString) { inString = true; continue; }
+                if (c === '"' && inString) { inString = false; continue; }
+                if (inString) continue;
+                if (c === '{') depth++;
+                else if (c === '}') { depth--; if (depth === 0) return i; }
+            }
+            return -1;
+        }
+
         function tryExtractTrade(text) {
-            if (typeof text !== 'string') return;
-            if (text.indexOf('42[') !== 0) return;
-            if (!/\["(buy|trade|order|open_trade|place)"/i.test(text)) return;
-
-            logToBridge('CANDIDATE: ' + text.substring(0, 200));
-
-            var jsonStart = text.indexOf('{');
-            var jsonEnd = text.lastIndexOf('}');
-            if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) return;
-
+            if (typeof text !== 'string' || text.length < 10) return;
+            
+            if (text.indexOf('"asset"') === -1 && text.indexOf("'asset'") === -1) return;
+            if (text.indexOf('"amount"') === -1 && text.indexOf('"sum"') === -1) return;
+            
+            var start = text.indexOf('{');
+            if (start === -1) return;
+            var end = findJsonEnd(text, start);
+            if (end === -1) return;
+            
             try {
-                var p = JSON.parse(text.substring(jsonStart, jsonEnd + 1));
-                var asset = p.asset || p.symbol || p.instrument || p.pair || p.sym;
-                var action = p.action !== undefined ? p.action : (p.direction !== undefined ? p.direction : p.side);
-                var amount = p.amount || p.sum || p.price || p.investment || p.invest;
-                var expiry = p.time || p.duration || p.expiry || p.expiration || p.exp || 60;
-
-                if (!asset || action === undefined || !amount) {
-                    logToBridge('MISSING_FIELDS: ' + text.substring(0, 150));
-                    return;
-                }
-
-                var dir = null;
-                if (action === 1 || action === 'call' || action === 'up' || action === true) dir = 'call';
-                else if (action === -1 || action === 'put' || action === 'down' || action === false) dir = 'put';
-                if (!dir) {
-                    logToBridge('UNKNOWN_DIR: ' + String(action));
-                    return;
-                }
-
-                var trade = {
-                    asset: String(asset),
-                    direction: dir,
-                    amount: parseFloat(amount),
-                    expiry: parseInt(expiry)
-                };
-
-                logToBridge('TRADE: ' + JSON.stringify(trade));
-
+                var p = JSON.parse(text.substring(start, end + 1));
+            } catch(e) {
+                log('ParseFail: ' + e.message);
+                return;
+            }
+            
+            var asset = p.asset || p.symbol || p.instrument || p.pair;
+            var amount = p.amount || p.sum || p.price || p.investment;
+            var action = p.action !== undefined ? p.action : (p.direction !== undefined ? p.direction : p.side);
+            var expiry = p.time || p.duration || p.expiry || 60;
+            
+            if (!asset || !amount) {
+                log('Missing: ' + Object.keys(p).join(','));
+                return;
+            }
+            
+            var dir = null;
+            if (action === 1 || action === 'call' || action === 'up' || action === true) dir = 'call';
+            else if (action === -1 || action === 'put' || action === 'down' || action === false) dir = 'put';
+            
+            if (!dir) {
+                log('BadDir: ' + String(action));
+                return;
+            }
+            
+            var trade = {
+                asset: String(asset),
+                direction: dir,
+                amount: parseFloat(amount),
+                expiry: parseInt(expiry)
+            };
+            
+            log('TRADE: ' + JSON.stringify(trade));
+            
+            try {
                 if (window.OscarBridge && window.OscarBridge.onTrade) {
                     window.OscarBridge.onTrade(JSON.stringify(trade));
                 }
-            } catch(e) {
-                logToBridge('PARSE_ERR: ' + e.message);
-            }
+            } catch(e) {}
         }
 
-        // =========== main processor ===========
         function processText(text) {
             try {
                 if (typeof text !== 'string' || text.length < 5) return;
-                // SSID extraction
                 var m1 = text.match(/"session"\s*:\s*"([^"]+)"/);
                 if (m1 && m1[1]) pushSsid(m1[1]);
-                var m2 = text.match(/"token"\s*:\s*"([^"]+)"/);
-                if (m2 && m2[1]) pushSsid(m2[1]);
-                // Trade extraction
                 tryExtractTrade(text);
             } catch(e) {}
         }
@@ -146,7 +171,6 @@ class MainActivity : AppCompatActivity() {
             } catch(e) {}
         }
 
-        // =========== hook WebSocket ===========
         var OWS = window.WebSocket;
         if (OWS) {
             var HookedWS = function(url, protocols) {
@@ -171,31 +195,79 @@ class MainActivity : AppCompatActivity() {
             window.WebSocket = HookedWS;
         }
 
-        if (window.WebSocket && window.WebSocket.prototype && window.WebSocket.prototype.send) {
-            var origSend = window.WebSocket.prototype.send;
-            window.WebSocket.prototype.send = function(data) {
-                if (typeof data === 'string') processText(data);
+        if (OWS && OWS.prototype && OWS.prototype.send) {
+            var origSend = OWS.prototype.send;
+            OWS.prototype.send = function(data) {
+                try {
+                    if (typeof data === 'string') processText(data);
+                    else if (data instanceof ArrayBuffer) {
+                        try { processText(new TextDecoder('utf-8').decode(new Uint8Array(data))); } catch(e) {}
+                    }
+                } catch(e) {}
                 return origSend.apply(this, arguments);
             };
         }
 
-        // =========== force demo account ===========
-        var demoClicks = 0;
+        var origFetch = window.fetch;
+        if (origFetch) {
+            window.fetch = function(url, opts) {
+                try {
+                    if (opts && opts.body) {
+                        var body = String(opts.body);
+                        if (body.indexOf('asset') !== -1 && (body.indexOf('amount') !== -1 || body.indexOf('sum') !== -1)) {
+                            raw('[FETCH] ' + (typeof url === 'string' ? url : (url && url.url) || '') + ' | ' + body.substring(0, 400));
+                            processText(body);
+                        }
+                    }
+                } catch(e) {}
+                return origFetch.apply(this, arguments);
+            };
+        }
+
+        var OrigXHR = window.XMLHttpRequest;
+        if (OrigXHR && OrigXHR.prototype && OrigXHR.prototype.send) {
+            var origXhrSend = OrigXHR.prototype.send;
+            OrigXHR.prototype.send = function(body) {
+                try {
+                    if (body && typeof body === 'string') {
+                        if (body.indexOf('asset') !== -1 && (body.indexOf('amount') !== -1 || body.indexOf('sum') !== -1)) {
+                            raw('[XHR] ' + body.substring(0, 400));
+                            processText(body);
+                        }
+                    }
+                } catch(e) {}
+                return origXhrSend.apply(this, arguments);
+            };
+        }
+
+        // محاولة الضغط على الحساب التجريبي
+        var demoAttempts = 0;
         function tryForceDemo() {
-            if (demoClicks > 10) return;
+            if (demoAttempts > 15) return;
             try {
-                var selectors = [
-                    '[data-account-type="demo"]',
-                    '[data-account="demo"]',
-                    '.account-switcher-demo',
-                    '[class*="demo"][role="button"]'
+                var sels = [
+                    '[data-account="demo"]:not(.active):not(.selected)',
+                    '[data-account-type="demo"]:not(.active):not(.selected)',
+                    '[data-testid="demo-account"]:not(.active):not(.selected)'
                 ];
-                for (var i = 0; i < selectors.length; i++) {
-                    var el = document.querySelector(selectors[i]);
-                    if (el && !el.classList.contains('active') && !el.classList.contains('selected')) {
+                for (var i = 0; i < sels.length; i++) {
+                    var el = document.querySelector(sels[i]);
+                    if (el) {
                         el.click();
-                        demoClicks++;
-                        logToBridge('Switched to demo');
+                        demoAttempts++;
+                        log('ForcedDemo#' + i);
+                        return;
+                    }
+                }
+                var clickables = document.querySelectorAll('button, [role="button"], [role="tab"]');
+                for (var j = 0; j < clickables.length; j++) {
+                    var t = (clickables[j].textContent || '').trim();
+                    if ((t === 'Demo' || t === 'تجريبي' || t.toLowerCase() === 'demo') 
+                        && !clickables[j].classList.contains('active')
+                        && !clickables[j].classList.contains('selected')) {
+                        clickables[j].click();
+                        demoAttempts++;
+                        log('ForcedDemoText');
                         return;
                     }
                 }
@@ -203,7 +275,7 @@ class MainActivity : AppCompatActivity() {
         }
         setInterval(tryForceDemo, 3000);
 
-        logToBridge('Hook injected');
+        log('Hook injected');
     })();
     """.trimIndent()
 
@@ -229,8 +301,10 @@ class MainActivity : AppCompatActivity() {
                 val res = client.newCall(req).execute()
                 val json = JSONObject(res.body?.string() ?: "{}")
                 isMasterLinked = json.optBoolean("linked", false)
+                android.util.Log.d("OscarAdmin", "is_linked check: $isMasterLinked")
             } catch (e: Exception) {
                 isMasterLinked = false
+                android.util.Log.e("OscarAdmin", "is_linked check failed: ${e.message}")
             }
             withContext(Dispatchers.Main) { callback() }
         }
@@ -320,9 +394,19 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
         }
 
-        webView = WebView(this).apply {
+        swipeRefresh = SwipeRefreshLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            setColorSchemeColors(Color.parseColor("#d4af37"))
+            setOnRefreshListener {
+                if (currentTab == "settings") webView.reload()
+                swipeRefresh.isRefreshing = false
+            }
         }
+
+        webView = WebView(this).apply {
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        swipeRefresh.addView(webView)
 
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -336,6 +420,15 @@ class MainActivity : AppCompatActivity() {
             setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(5, 0, 5, 0) }
             setOnClickListener { showSettings() }
+            setOnLongClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("تسجيل الخروج")
+                    .setMessage("هل تريد تسجيل الخروج من لوحة الإدارة؟")
+                    .setPositiveButton("نعم") { _, _ -> logoutAdmin() }
+                    .setNegativeButton("إلغاء", null)
+                    .show()
+                true
+            }
         }
 
         btnMarket = Button(this).apply {
@@ -350,7 +443,7 @@ class MainActivity : AppCompatActivity() {
         bottomBar.addView(btnMarket)
 
         root.addView(statusBar)
-        root.addView(webView)
+        root.addView(swipeRefresh)
         root.addView(bottomBar)
         setContentView(root)
         configureWebView()
@@ -358,18 +451,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun showSettings() {
         currentTab = "settings"
-        statusBar.text = if (isMasterLinked) "📊 لوحة التحكم ✅" else "📊 لوحة التحكم"
+        swipeRefresh.isEnabled = true
+        statusBar.text = if (isMasterLinked) "📊 الإعدادات — الحساب مربوط ✅" else "📊 الإعدادات — الحساب غير مربوط ⚠️"
         updateTabButtons()
         webView.loadUrl(ADMIN_PANEL_URL)
     }
 
     private fun showMarket() {
         currentTab = "market"
-        statusBar.text = if (isMasterLinked) "📈 السوق — حساب الماستر مربوط ✅" else "📈 السوق — جاري ربط الحساب..."
+        swipeRefresh.isEnabled = false
         updateTabButtons()
-        hasCapturedThisSession = false
-        if (webView.url == null || !webView.url!!.contains("quotex.com")) {
-            webView.loadUrl("$QX_DOMAIN/ar/trade")
+        // إعادة التحقق من ربط الماستر (بدون إرسال SSID جديد)
+        checkMasterLinked {
+            statusBar.text = if (isMasterLinked) "📈 السوق — الماستر مربوط ✅ — افتح صفقة وستُنسخ" else "📈 السوق — ربط الماستر..."
+            if (webView.url == null || !webView.url!!.contains("quotex.com")) {
+                webView.loadUrl("$QX_DOMAIN/ar/trade")
+            }
         }
     }
 
@@ -402,7 +499,6 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         webView.addJavascriptInterface(Bridge(), "OscarBridge")
 
-        // Inject at document start for reliability
         try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 WebViewCompat.addDocumentStartJavaScript(webView, EARLY_HOOK_JS, setOf("*"))
@@ -419,14 +515,19 @@ class MainActivity : AppCompatActivity() {
             }
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                swipeRefresh.isRefreshing = false
                 if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
             }
         }
     }
 
     private fun sendSsidToServer(ssid: String) {
-        if (hasCapturedThisSession || ssid.length < 25) return
-        hasCapturedThisSession = true
+        if (ssidSentThisSession || ssid.length < 25) return
+        if (isMasterLinked) {
+            android.util.Log.d("OscarAdmin", "Already linked, skipping SSID")
+            return
+        }
+        ssidSentThisSession = true
         statusBar.text = "🔄 جاري ربط حساب الماستر..."
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
 
@@ -445,20 +546,20 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
                         isMasterLinked = true
-                        statusBar.text = "✅ تم ربط حساب الماستر"
+                        statusBar.text = "✅ تم ربط الماستر — افتح صفقة وستُنسخ"
                     } else {
                         statusBar.text = "⚠️ ${json.optString("error")}"
-                        hasCapturedThisSession = false
+                        ssidSentThisSession = false
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { hasCapturedThisSession = false }
+                withContext(Dispatchers.Main) { ssidSentThisSession = false }
             }
         }
     }
 
     private fun sendTradeToServer(tradeJson: String) {
-        statusBar.text = "📤 جاري إرسال الصفقة للمتابعين..."
+        statusBar.text = "📤 جاري إرسال الصفقة..."
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val payload = JSONObject(tradeJson)
@@ -473,7 +574,7 @@ class MainActivity : AppCompatActivity() {
                         val copied = json.optInt("copied", 0)
                         val total = json.optInt("total", 0)
                         statusBar.text = "✅ نُسخت لـ $copied من $total متابع"
-                        Toast.makeText(this@MainActivity, "✅ نُسخت لـ $copied من $total", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this@MainActivity, "✅ نُسخت لـ $copied/$total", Toast.LENGTH_SHORT).show()
                     } else {
                         statusBar.text = "⚠️ ${json.optString("error")}"
                     }
@@ -484,15 +585,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun sendRawToServer(raw: String) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val payload = JSONObject().put("raw", raw)
+                val req = Request.Builder()
+                    .url("$BASE_URL/api/admin/realtime_trade")
+                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+                client.newCall(req).execute()
+            } catch (e: Exception) {}
+        }
+    }
+
+    private fun logoutAdmin() {
+        prefs.edit().remove("is_admin_logged_in").apply()
+        val cm = CookieManager.getInstance()
+        cm.removeAllCookies(null)
+        cm.flush()
+        webView.clearCache(true)
+        webView.clearHistory()
+        webView.loadUrl("about:blank")
+        finish()
+    }
+
     inner class Bridge {
         @JavascriptInterface
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
             runOnUiThread {
-                // Only link if not already linked
-                if (currentTab == "market" && !isMasterLinked && !hasCapturedThisSession) {
-                    sendSsidToServer(ssid)
-                }
+                if (currentTab == "market") sendSsidToServer(ssid)
             }
         }
 
@@ -505,13 +627,18 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface
         fun onLog(msg: String) {
-            android.util.Log.d("OscarAdmin", msg)
+            android.util.Log.d("OscarAdminJS", msg)
             runOnUiThread {
-                // Show diagnostic messages in status bar for debugging
-                if (currentTab == "market" && (msg.startsWith("TRADE") || msg.startsWith("CANDIDATE") || msg.startsWith("MISSING") || msg.startsWith("PARSE") || msg.startsWith("UNKNOWN"))) {
+                if (currentTab == "market" && (msg.startsWith("TRADE:") || msg.startsWith("Missing") || msg.startsWith("BadDir") || msg.startsWith("ParseFail"))) {
                     statusBar.text = "🔍 $msg"
                 }
             }
+        }
+
+        @JavascriptInterface
+        fun onRaw(raw: String) {
+            android.util.Log.d("OscarAdminRAW", raw)
+            sendRawToServer(raw)
         }
     }
 
