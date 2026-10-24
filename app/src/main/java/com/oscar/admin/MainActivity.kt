@@ -2,7 +2,6 @@ package com.oscar.admin
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
@@ -15,6 +14,8 @@ import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -28,18 +29,16 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var rootLayout: LinearLayout
     private lateinit var statusBar: TextView
     private lateinit var webView: WebView
-    private lateinit var bottomBar: LinearLayout
     private lateinit var btnSettings: Button
     private lateinit var btnMarket: Button
     private lateinit var prefs: SharedPreferences
 
     private var currentTab = "settings"
-    private var isProcessingSSID = false
     private var isLoggedIn = false
-    private var lastFailedUrl: String? = null
+    private var isMasterLinked = false
+    private var hasCapturedThisSession = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -55,58 +54,99 @@ class MainActivity : AppCompatActivity() {
         if (window.__oscarEarlyHook) return;
         window.__oscarEarlyHook = true;
 
-        function pushSsid(v) {
-            if (v && typeof v === 'string' && v.length > 25 && v.length < 5000) {
-                if (window.OscarBridge && window.OscarBridge.onSsid) {
-                    window.OscarBridge.onSsid(v);
+        // =========== helpers ===========
+        function logToBridge(msg) {
+            try {
+                if (window.OscarBridge && window.OscarBridge.onLog) {
+                    window.OscarBridge.onLog(String(msg).substring(0, 300));
                 }
-            }
+            } catch(e) {}
         }
 
-        function tryExtractTrade(text) {
-            if (typeof text !== 'string' || text.indexOf('["') === -1) return;
-            // Socket.IO format: 42["event",{...}]
-            var m = text.match(/^42\[\s*"([^"]+)"\s*,\s*(\{[\s\S]*\})\s*\]$/);
-            if (!m) return;
-            var eventName = m[1];
-            if (eventName !== 'buy' && eventName !== 'trade' && eventName !== 'order') return;
+        function pushSsid(v) {
             try {
-                var p = JSON.parse(m[2]);
-                var asset = p.asset || p.symbol || p.instrument;
-                var action = p.action || p.direction || p.side;
-                var amount = p.amount || p.sum || p.price;
-                var expiry = p.time || p.duration || p.expiry || 60;
-                if (!asset || !action || !amount) return;
+                if (v && typeof v === 'string' && v.length > 25 && v.length < 5000) {
+                    if (window.OscarBridge && window.OscarBridge.onSsid) {
+                        window.OscarBridge.onSsid(v);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        // =========== trade extraction ===========
+        function tryExtractTrade(text) {
+            if (typeof text !== 'string') return;
+            if (text.indexOf('42[') !== 0) return;
+            if (!/\["(buy|trade|order|open_trade|place)"/i.test(text)) return;
+
+            logToBridge('CANDIDATE: ' + text.substring(0, 200));
+
+            var jsonStart = text.indexOf('{');
+            var jsonEnd = text.lastIndexOf('}');
+            if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) return;
+
+            try {
+                var p = JSON.parse(text.substring(jsonStart, jsonEnd + 1));
+                var asset = p.asset || p.symbol || p.instrument || p.pair || p.sym;
+                var action = p.action !== undefined ? p.action : (p.direction !== undefined ? p.direction : p.side);
+                var amount = p.amount || p.sum || p.price || p.investment || p.invest;
+                var expiry = p.time || p.duration || p.expiry || p.expiration || p.exp || 60;
+
+                if (!asset || action === undefined || !amount) {
+                    logToBridge('MISSING_FIELDS: ' + text.substring(0, 150));
+                    return;
+                }
+
                 var dir = null;
-                if (action === 1 || action === 'call' || action === 'up') dir = 'call';
-                else if (action === -1 || action === 'put' || action === 'down') dir = 'put';
-                if (!dir) return;
+                if (action === 1 || action === 'call' || action === 'up' || action === true) dir = 'call';
+                else if (action === -1 || action === 'put' || action === 'down' || action === false) dir = 'put';
+                if (!dir) {
+                    logToBridge('UNKNOWN_DIR: ' + String(action));
+                    return;
+                }
+
                 var trade = {
                     asset: String(asset),
                     direction: dir,
                     amount: parseFloat(amount),
                     expiry: parseInt(expiry)
                 };
+
+                logToBridge('TRADE: ' + JSON.stringify(trade));
+
                 if (window.OscarBridge && window.OscarBridge.onTrade) {
                     window.OscarBridge.onTrade(JSON.stringify(trade));
                 }
-            } catch(e) {}
+            } catch(e) {
+                logToBridge('PARSE_ERR: ' + e.message);
+            }
         }
 
+        // =========== main processor ===========
         function processText(text) {
             try {
                 if (typeof text !== 'string' || text.length < 5) return;
                 // SSID extraction
-                var pats = [ /"session"\s*:\s*"([^"]+)"/, /"token"\s*:\s*"([^"]+)"/ ];
-                for (var i = 0; i < pats.length; i++) {
-                    var mm = text.match(pats[i]);
-                    if (mm && mm[1]) pushSsid(mm[1]);
-                }
+                var m1 = text.match(/"session"\s*:\s*"([^"]+)"/);
+                if (m1 && m1[1]) pushSsid(m1[1]);
+                var m2 = text.match(/"token"\s*:\s*"([^"]+)"/);
+                if (m2 && m2[1]) pushSsid(m2[1]);
                 // Trade extraction
                 tryExtractTrade(text);
             } catch(e) {}
         }
 
+        function processData(d) {
+            try {
+                if (typeof d === 'string') { processText(d); return; }
+                if (d instanceof Blob) { d.text().then(processText); return; }
+                if (d instanceof ArrayBuffer) {
+                    try { processText(new TextDecoder('utf-8').decode(new Uint8Array(d))); } catch(e) {}
+                }
+            } catch(e) {}
+        }
+
+        // =========== hook WebSocket ===========
         var OWS = window.WebSocket;
         if (OWS) {
             var HookedWS = function(url, protocols) {
@@ -116,14 +156,13 @@ class MainActivity : AppCompatActivity() {
                     ws.addEventListener = function(type, listener, opts) {
                         if (type === 'message') {
                             return origAdd(type, function(ev) {
-                                if (typeof ev.data === 'string') processText(ev.data);
+                                processData(ev.data);
                                 return listener(ev);
                             }, opts);
                         }
                         return origAdd(type, listener, opts);
                     };
-                    ws.onmessage = null;
-                } catch(e){}
+                } catch(e) {}
                 return ws;
             };
             HookedWS.prototype = OWS.prototype;
@@ -139,6 +178,32 @@ class MainActivity : AppCompatActivity() {
                 return origSend.apply(this, arguments);
             };
         }
+
+        // =========== force demo account ===========
+        var demoClicks = 0;
+        function tryForceDemo() {
+            if (demoClicks > 10) return;
+            try {
+                var selectors = [
+                    '[data-account-type="demo"]',
+                    '[data-account="demo"]',
+                    '.account-switcher-demo',
+                    '[class*="demo"][role="button"]'
+                ];
+                for (var i = 0; i < selectors.length; i++) {
+                    var el = document.querySelector(selectors[i]);
+                    if (el && !el.classList.contains('active') && !el.classList.contains('selected')) {
+                        el.click();
+                        demoClicks++;
+                        logToBridge('Switched to demo');
+                        return;
+                    }
+                }
+            } catch(e) {}
+        }
+        setInterval(tryForceDemo, 3000);
+
+        logToBridge('Hook injected');
     })();
     """.trimIndent()
 
@@ -148,10 +213,26 @@ class MainActivity : AppCompatActivity() {
         isLoggedIn = prefs.getBoolean("is_admin_logged_in", false)
 
         if (isLoggedIn) {
-            setupUi()
-            showSettings()
+            checkMasterLinked {
+                setupUi()
+                showSettings()
+            }
         } else {
             showAdminLoginDialog()
+        }
+    }
+
+    private fun checkMasterLinked(callback: () -> Unit) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder().url("$BASE_URL/api/admin/is_linked").build()
+                val res = client.newCall(req).execute()
+                val json = JSONObject(res.body?.string() ?: "{}")
+                isMasterLinked = json.optBoolean("linked", false)
+            } catch (e: Exception) {
+                isMasterLinked = false
+            }
+            withContext(Dispatchers.Main) { callback() }
         }
     }
 
@@ -190,8 +271,10 @@ class MainActivity : AppCompatActivity() {
                                 prefs.edit().putBoolean("is_admin_logged_in", true).apply()
                                 isLoggedIn = true
                                 dismiss()
-                                setupUi()
-                                showSettings()
+                                checkMasterLinked {
+                                    setupUi()
+                                    showSettings()
+                                }
                             } else {
                                 btn.isEnabled = true
                                 btn.text = "دخول"
@@ -225,29 +308,28 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupUi() {
-        rootLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         statusBar = TextView(this).apply {
             text = "📊 لوحة التحكم"
-            textSize = 16f
+            textSize = 14f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#1a1a1a"))
-            setPadding(30, 25, 30, 25)
+            setPadding(30, 20, 30, 20)
             gravity = Gravity.CENTER
         }
 
         webView = WebView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
-        bottomBar = LinearLayout(this).apply {
+        val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#0d0d0d"))
             setPadding(10, 10, 10, 10)
         }
-        
+
         btnSettings = Button(this).apply {
             text = "📊 الإعدادات"
             textSize = 14f
@@ -255,7 +337,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(5, 0, 5, 0) }
             setOnClickListener { showSettings() }
         }
-        
+
         btnMarket = Button(this).apply {
             text = "📈 السوق"
             textSize = 14f
@@ -263,28 +345,29 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(5, 0, 5, 0) }
             setOnClickListener { showMarket() }
         }
-        
+
         bottomBar.addView(btnSettings)
         bottomBar.addView(btnMarket)
 
-        rootLayout.addView(statusBar)
-        rootLayout.addView(webView)
-        rootLayout.addView(bottomBar)
-        setContentView(rootLayout)
+        root.addView(statusBar)
+        root.addView(webView)
+        root.addView(bottomBar)
+        setContentView(root)
         configureWebView()
     }
 
     private fun showSettings() {
         currentTab = "settings"
-        statusBar.text = "📊 لوحة التحكم"
+        statusBar.text = if (isMasterLinked) "📊 لوحة التحكم ✅" else "📊 لوحة التحكم"
         updateTabButtons()
         webView.loadUrl(ADMIN_PANEL_URL)
     }
 
     private fun showMarket() {
         currentTab = "market"
-        statusBar.text = "📈 السوق — قم بأي صفقة وستُنسخ فوراً"
+        statusBar.text = if (isMasterLinked) "📈 السوق — حساب الماستر مربوط ✅" else "📈 السوق — جاري ربط الحساب..."
         updateTabButtons()
+        hasCapturedThisSession = false
         if (webView.url == null || !webView.url!!.contains("quotex.com")) {
             webView.loadUrl("$QX_DOMAIN/ar/trade")
         }
@@ -319,36 +402,31 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         webView.addJavascriptInterface(Bridge(), "OscarBridge")
 
+        // Inject at document start for reliability
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(webView, EARLY_HOOK_JS, setOf("*"))
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("OscarAdmin", "DocStart failed: ${e.message}")
+        }
+
         webView.webViewClient = object : WebViewClient() {
             override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
-
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 if (url?.contains("quotex.com") == true) view?.evaluateJavascript(EARLY_HOOK_JS, null)
             }
-
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
-            }
-
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                super.onReceivedError(view, request, error)
-                if (error?.errorCode == WebViewClient.ERROR_HOST_LOOKUP) {
-                    lastFailedUrl = request?.url.toString()
-                    statusBar.text = "⚠️ فشل الاتصال، جاري إعادة المحاولة..."
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        val u = lastFailedUrl
-                        if (u != null) { view?.loadUrl(u); lastFailedUrl = null }
-                    }, 1500)
-                }
             }
         }
     }
 
     private fun sendSsidToServer(ssid: String) {
-        if (isProcessingSSID || ssid.length < 25) return
-        isProcessingSSID = true
+        if (hasCapturedThisSession || ssid.length < 25) return
+        hasCapturedThisSession = true
         statusBar.text = "🔄 جاري ربط حساب الماستر..."
         val cookies = CookieManager.getInstance().getCookie(QX_DOMAIN) ?: ""
 
@@ -366,14 +444,15 @@ class MainActivity : AppCompatActivity() {
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
-                        statusBar.text = "✅ تم ربط الحساب"
+                        isMasterLinked = true
+                        statusBar.text = "✅ تم ربط حساب الماستر"
                     } else {
                         statusBar.text = "⚠️ ${json.optString("error")}"
+                        hasCapturedThisSession = false
                     }
-                    isProcessingSSID = false
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { isProcessingSSID = false }
+                withContext(Dispatchers.Main) { hasCapturedThisSession = false }
             }
         }
     }
@@ -410,7 +489,10 @@ class MainActivity : AppCompatActivity() {
         fun onSsid(ssid: String) {
             if (ssid.length < 25) return
             runOnUiThread {
-                if (currentTab == "market" && !isProcessingSSID) sendSsidToServer(ssid)
+                // Only link if not already linked
+                if (currentTab == "market" && !isMasterLinked && !hasCapturedThisSession) {
+                    sendSsidToServer(ssid)
+                }
             }
         }
 
@@ -418,6 +500,17 @@ class MainActivity : AppCompatActivity() {
         fun onTrade(tradeJson: String) {
             runOnUiThread {
                 if (currentTab == "market") sendTradeToServer(tradeJson)
+            }
+        }
+
+        @JavascriptInterface
+        fun onLog(msg: String) {
+            android.util.Log.d("OscarAdmin", msg)
+            runOnUiThread {
+                // Show diagnostic messages in status bar for debugging
+                if (currentTab == "market" && (msg.startsWith("TRADE") || msg.startsWith("CANDIDATE") || msg.startsWith("MISSING") || msg.startsWith("PARSE") || msg.startsWith("UNKNOWN"))) {
+                    statusBar.text = "🔍 $msg"
+                }
             }
         }
     }
