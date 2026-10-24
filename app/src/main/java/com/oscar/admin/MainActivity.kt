@@ -6,8 +6,6 @@ import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.*
@@ -83,9 +81,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         function findJsonEnd(text, start) {
-            var depth = 0;
-            var inString = false;
-            var escapeNext = false;
+            var depth = 0, inString = false, escapeNext = false;
             for (var i = start; i < text.length; i++) {
                 var c = text[i];
                 if (escapeNext) { escapeNext = false; continue; }
@@ -101,50 +97,46 @@ class MainActivity : AppCompatActivity() {
 
         function tryExtractTrade(text) {
             if (typeof text !== 'string' || text.length < 10) return;
-            
-            if (text.indexOf('"asset"') === -1 && text.indexOf("'asset'") === -1) return;
+            if (text.indexOf('"asset"') === -1) return;
             if (text.indexOf('"amount"') === -1 && text.indexOf('"sum"') === -1) return;
-            
+
             var start = text.indexOf('{');
             if (start === -1) return;
             var end = findJsonEnd(text, start);
             if (end === -1) return;
-            
+
             try {
                 var p = JSON.parse(text.substring(start, end + 1));
             } catch(e) {
                 log('ParseFail: ' + e.message);
                 return;
             }
-            
+
             var asset = p.asset || p.symbol || p.instrument || p.pair;
             var amount = p.amount || p.sum || p.price || p.investment;
             var action = p.action !== undefined ? p.action : (p.direction !== undefined ? p.direction : p.side);
             var expiry = p.time || p.duration || p.expiry || 60;
-            
+
             if (!asset || !amount) {
                 log('Missing: ' + Object.keys(p).join(','));
                 return;
             }
-            
+
             var dir = null;
             if (action === 1 || action === 'call' || action === 'up' || action === true) dir = 'call';
             else if (action === -1 || action === 'put' || action === 'down' || action === false) dir = 'put';
-            
-            if (!dir) {
-                log('BadDir: ' + String(action));
-                return;
-            }
-            
+
+            if (!dir) { log('BadDir: ' + String(action)); return; }
+
             var trade = {
                 asset: String(asset),
                 direction: dir,
                 amount: parseFloat(amount),
                 expiry: parseInt(expiry)
             };
-            
+
             log('TRADE: ' + JSON.stringify(trade));
-            
+
             try {
                 if (window.OscarBridge && window.OscarBridge.onTrade) {
                     window.OscarBridge.onTrade(JSON.stringify(trade));
@@ -240,7 +232,6 @@ class MainActivity : AppCompatActivity() {
             };
         }
 
-        // محاولة الضغط على الحساب التجريبي
         var demoAttempts = 0;
         function tryForceDemo() {
             if (demoAttempts > 15) return;
@@ -252,23 +243,15 @@ class MainActivity : AppCompatActivity() {
                 ];
                 for (var i = 0; i < sels.length; i++) {
                     var el = document.querySelector(sels[i]);
-                    if (el) {
-                        el.click();
-                        demoAttempts++;
-                        log('ForcedDemo#' + i);
-                        return;
-                    }
+                    if (el) { el.click(); demoAttempts++; log('ForcedDemo#' + i); return; }
                 }
                 var clickables = document.querySelectorAll('button, [role="button"], [role="tab"]');
                 for (var j = 0; j < clickables.length; j++) {
                     var t = (clickables[j].textContent || '').trim();
-                    if ((t === 'Demo' || t === 'تجريبي' || t.toLowerCase() === 'demo') 
+                    if ((t === 'Demo' || t === 'تجريبي' || t.toLowerCase() === 'demo')
                         && !clickables[j].classList.contains('active')
                         && !clickables[j].classList.contains('selected')) {
-                        clickables[j].click();
-                        demoAttempts++;
-                        log('ForcedDemoText');
-                        return;
+                        clickables[j].click(); demoAttempts++; log('ForcedDemoText'); return;
                     }
                 }
             } catch(e) {}
@@ -399,7 +382,7 @@ class MainActivity : AppCompatActivity() {
             setColorSchemeColors(Color.parseColor("#d4af37"))
             setOnRefreshListener {
                 if (currentTab == "settings") webView.reload()
-                swipeRefresh.isRefreshing = false
+                isRefreshing = false
             }
         }
 
@@ -461,7 +444,6 @@ class MainActivity : AppCompatActivity() {
         currentTab = "market"
         swipeRefresh.isEnabled = false
         updateTabButtons()
-        // إعادة التحقق من ربط الماستر (بدون إرسال SSID جديد)
         checkMasterLinked {
             statusBar.text = if (isMasterLinked) "📈 السوق — الماستر مربوط ✅ — افتح صفقة وستُنسخ" else "📈 السوق — ربط الماستر..."
             if (webView.url == null || !webView.url!!.contains("quotex.com")) {
