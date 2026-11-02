@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -48,6 +49,48 @@ class MainActivity : AppCompatActivity() {
     private val BASE_URL = "https://signal-bott.onrender.com"
     private val QX_DOMAIN = "https://quotex.com"
     private val ADMIN_PANEL_URL = "$BASE_URL/admin/panel"
+
+    // يحوّل جداول لوحة المشرف إلى بطاقات تناسب شاشة الجوال (لا نلمس الموقع، الإصلاح داخل التطبيق)
+    private val PANEL_FIX_JS = """
+(function(){
+  try {
+    if (window.__oscarPanelFix) return;
+    window.__oscarPanelFix = true;
+    var css = ''
+      + 'html,body{overflow-x:hidden !important;max-width:100vw !important;}'
+      + '.table-wrap{overflow:visible !important;border:none !important;background:transparent !important;}'
+      + 'table,thead,tbody,tfoot,tr,td,th{display:block !important;width:100% !important;box-sizing:border-box !important;min-width:0 !important;}'
+      + 'thead{display:none !important;}'
+      + 'tr{margin:0 0 12px 0 !important;padding:10px 14px !important;border:1px solid rgba(255,255,255,.16) !important;border-radius:18px !important;background:rgba(255,255,255,.05) !important;}'
+      + 'td{display:flex !important;justify-content:space-between !important;align-items:center !important;gap:12px !important;padding:8px 0 !important;border:0 !important;border-bottom:1px solid rgba(255,255,255,.07) !important;text-align:start !important;word-break:break-word !important;overflow-wrap:anywhere !important;white-space:normal !important;}'
+      + 'td:last-child{border-bottom:0 !important;}'
+      + 'td::before{content:attr(data-label);color:#8d97ab;font-size:12px;font-weight:700;flex:0 0 34%;text-align:start;}'
+      + 'td[data-label=""]::before{display:none;}'
+      + 'td form,td .row-actions,td .actions{display:flex !important;flex-wrap:wrap !important;gap:8px !important;justify-content:flex-end !important;}'
+      + 'td button,td a.btn,td .btn{max-width:100% !important;}'
+      + 'pre,code{white-space:pre-wrap !important;word-break:break-all !important;max-width:100% !important;}'
+      + 'img,svg,canvas,video,iframe{max-width:100% !important;}'
+      + 'input,select,textarea{max-width:100% !important;}';
+    var st = document.createElement('style');
+    st.id = 'oscar-panel-fix';
+    st.textContent = css;
+    document.head.appendChild(st);
+    var tables = document.querySelectorAll('table');
+    for (var t = 0; t < tables.length; t++) {
+      var heads = tables[t].querySelectorAll('thead th');
+      var labels = [];
+      for (var h = 0; h < heads.length; h++) labels.push((heads[h].textContent || '').trim());
+      var rows = tables[t].querySelectorAll('tbody tr');
+      for (var r = 0; r < rows.length; r++) {
+        var cells = rows[r].children;
+        for (var c = 0; c < cells.length; c++) {
+          if (!cells[c].hasAttribute('data-label')) cells[c].setAttribute('data-label', labels[c] || '');
+        }
+      }
+    }
+  } catch (e) {}
+})();
+""".trimIndent()
 
     private val EARLY_HOOK_JS = """
     (function() {
@@ -251,8 +294,9 @@ class MainActivity : AppCompatActivity() {
     private fun checkMasterLinked(callback: () -> Unit) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val req = Request.Builder().url("$BASE_URL/api/admin/is_linked").build()
+                val req = Request.Builder().url("$BASE_URL/api/admin/is_linked").header("Cookie", adminCookie()).build()
                 val res = client.newCall(req).execute()
+                if (res.code == 401) { onAdminUnauthorized(); return@launch }
                 val json = JSONObject(res.body?.string() ?: "{}")
                 isMasterLinked = json.optBoolean("linked", false)
             } catch (e: Exception) {
@@ -313,26 +357,46 @@ class MainActivity : AppCompatActivity() {
             }
     }
 
+    // كوكي جلسة المشرف (يُحفظ في WebView بعد تسجيل الدخول) ونرسله مع كل نداء لواجهات /api/admin
+    private fun adminCookie(): String = CookieManager.getInstance().getCookie(BASE_URL) ?: ""
+
+    // انتهت الجلسة أو لم تُقبل: نطلب تسجيل الدخول من جديد
+    private fun onAdminUnauthorized() {
+        runOnUiThread {
+            Toast.makeText(this, "🔐 انتهت جلسة المشرف، سجّل الدخول من جديد", Toast.LENGTH_LONG).show()
+            prefs.edit().remove("is_admin_logged_in").apply()
+            recreate()
+        }
+    }
+
     private fun verifyAdminPassword(password: String, onResult: (Boolean, String) -> Unit) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                // لا نتبع التحويل: كلمة المرور الصحيحة تعيد 302 فقط، والخاطئة تعيد 200 (صفحة الدخول)
+                val plain = client.newBuilder().followRedirects(false).followSslRedirects(false).build()
                 val req = Request.Builder()
                     .url("$BASE_URL/admin")
-                    .post("password=$password".toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+                    .post(FormBody.Builder().add("password", password).build())
                     .build()
-                val res = client.newCall(req).execute()
-                if (res.isSuccessful || res.code == 302) {
+                val res = plain.newCall(req).execute()
+                val ok = res.code == 302 || res.code == 303
+                if (ok) {
+                    // نمرّر جلسة المشرف إلى WebView حتى تفتح اللوحة مسجّلة وتعمل واجهات التطبيق
+                    val cm = CookieManager.getInstance()
+                    for (c in res.headers("Set-Cookie")) cm.setCookie(BASE_URL, c)
+                    cm.flush()
                     withContext(Dispatchers.Main) { onResult(true, "OK") }
                 } else {
-                    withContext(Dispatchers.Main) { onResult(false, "كلمة المرور غير صحيحة") }
+                    val msg = if (res.code == 429) "محاولات كثيرة، انتظر قليلاً" else "كلمة المرور غير صحيحة"
+                    withContext(Dispatchers.Main) { onResult(false, msg) }
                 }
+                res.close()
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { onResult(false, "خطأ اتصال: ${e.message}") }
             }
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
     private fun setupUi() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -468,6 +532,7 @@ class MainActivity : AppCompatActivity() {
                 super.onPageFinished(view, url)
                 swipeRefresh.isRefreshing = false
                 if (url.contains("quotex.com")) view.evaluateJavascript(EARLY_HOOK_JS, null)
+                if (url.contains("/admin")) view.evaluateJavascript(PANEL_FIX_JS, null)
             }
         }
 
@@ -546,9 +611,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 val req = Request.Builder()
                     .url("$BASE_URL/api/admin/link_master")
+                    .header("Cookie", adminCookie())
                     .post(payload.toString().toRequestBody("application/json".toMediaType()))
                     .build()
                 val res = client.newCall(req).execute()
+                if (res.code == 401) { onAdminUnauthorized(); return@launch }
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
@@ -572,9 +639,11 @@ class MainActivity : AppCompatActivity() {
                 val payload = JSONObject(tradeJson)
                 val req = Request.Builder()
                     .url("$BASE_URL/api/admin/realtime_trade")
+                    .header("Cookie", adminCookie())
                     .post(payload.toString().toRequestBody("application/json".toMediaType()))
                     .build()
                 val res = client.newCall(req).execute()
+                if (res.code == 401) { onAdminUnauthorized(); return@launch }
                 val json = JSONObject(res.body?.string() ?: "{}")
                 withContext(Dispatchers.Main) {
                     if (json.optBoolean("ok")) {
