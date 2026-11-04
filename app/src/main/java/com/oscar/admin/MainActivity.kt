@@ -5,11 +5,13 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.*
 import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
@@ -32,6 +34,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusBar: TextView
     private lateinit var webView: WebView
     private lateinit var swipeRefresh: SwipeRefreshLayout
+
+    // اختيار صورة لخلفية تطبيق المستخدمين من لوحة المشرف
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private val pickFile = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+        val cb = fileCallback
+        fileCallback = null
+        val uris = WebChromeClient.FileChooserParams.parseResult(res.resultCode, res.data)
+        cb?.onReceiveValue(uris)
+    }
     private lateinit var btnSettings: Button
     private lateinit var btnMarket: Button
     private lateinit var prefs: SharedPreferences
@@ -538,6 +549,22 @@ class MainActivity : AppCompatActivity() {
 
         // ★★★ هذا هو الإصلاح الرئيسي - يدعم confirm() و alert() و prompt() ★★★
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                fileCallback?.onReceiveValue(null)
+                fileCallback = filePathCallback
+                return try {
+                    pickFile.launch(fileChooserParams!!.createIntent())
+                    true
+                } catch (e: Exception) {
+                    fileCallback = null
+                    false
+                }
+            }
+
             override fun onJsAlert(
                 view: WebView?,
                 url: String?,
